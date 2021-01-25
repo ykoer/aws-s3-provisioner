@@ -531,7 +531,15 @@ func (c *obcController) setOBCMetaFields(obc *v1alpha1.ObjectBucketClaim) (err e
 	}
 
 	obc.SetFinalizers([]string{finalizer})
-	obc.SetLabels(c.provisionerLabels)
+	//obc.SetLabels(c.provisionerLabels)
+
+	// Merge provisioner labels with the existing ones instead overwriting them.
+	if obc.ObjectMeta.Labels == nil {
+		obc.ObjectMeta.Labels = make(map[string]string)
+	}
+	for k, v := range c.provisionerLabels {
+		obc.ObjectMeta.Labels[k] = v
+	}
 
 	logD.Info("updating OBC metadata")
 	obc, err = updateClaim(clib, obc, defaultRetryBaseInterval, defaultRetryTimeout)
