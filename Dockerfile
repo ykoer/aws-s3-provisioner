@@ -6,9 +6,9 @@ WORKDIR /build
 COPY go.mod .
 COPY go.sum .
 COPY cmd .
-RUN go mod download
+#RUN go mod download
+RUN go mod vendor
 RUN CGO_ENABLED=0 GOOS=linux go build -a -o aws-s3-provisioner .
-
 
 # generate clean, runtime image
 FROM registry.redhat.io/ubi8-minimal
