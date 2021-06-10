@@ -32,7 +32,7 @@ import (
 )
 
 const (
-        annotationEnableS3ServerSideEncryptionKey = "aws-s3-server-side-default-encryption"
+	annotationEnableS3ServerSideEncryptionKey = "objectbucket.io/aws-s3-server-side-encryption"
 )
 
 // Return the storage class for a given name.
@@ -101,8 +101,8 @@ func randomString(n int) string {
 
 func (p *awsS3Provisioner) createUserName(bkt string) string {
 	// prefix is bucket name
-	if len(bkt) > maxBucketLen  {
-		bkt = bkt[:(maxBucketLen-1)]
+	if len(bkt) > maxBucketLen {
+		bkt = bkt[:(maxBucketLen - 1)]
 	}
 
 	userbool := true
@@ -117,7 +117,7 @@ func (p *awsS3Provisioner) createUserName(bkt string) string {
 	return name
 }
 
-func (p *awsS3Provisioner) convertLabelsToS3BucketTags(labels map[string]string) []*s3.Tag {
+func (p *awsS3Provisioner) convertToS3BucketTags(labels map[string]string) []*s3.Tag {
 	result := make([]*s3.Tag, 0, len(labels))
 	for k, v := range labels {
 		t := &s3.Tag{

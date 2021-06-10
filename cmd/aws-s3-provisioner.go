@@ -22,6 +22,7 @@ import (
 	_ "net/url"
 	"os"
 	"os/signal"
+	"regexp"
 	"strings"
 	"syscall"
 
@@ -61,11 +62,14 @@ const (
 	maxBucketLen     = 58
 	maxUserLen       = 63
 	genUserLen       = 5
+	bucketPrefix     = "mpp-"
+	obcUidTag        = "ObjectBucketClaim_UID"
 )
 
 var (
-	kubeconfig string
-	masterURL  string
+	kubeconfig         string
+	masterURL          string
+	validTagValueChars = regexp.MustCompile("[^a-zA-Z0-9/=+-_@]+")
 )
 
 type awsS3Provisioner struct {
@@ -174,6 +178,19 @@ func (p *awsS3Provisioner) createBucket(bktName string) error {
 	return nil
 }
 
+func replaceInvalidCharacters(val string) string {
+	return strings.TrimSpace(validTagValueChars.ReplaceAllString(val, "_"))
+}
+
+func (p *awsS3Provisioner) cleanseTagValues() {
+	if p.bucketTags != nil && len(p.bucketTags) > 1 {
+		for _, tag := range p.bucketTags {
+			val := replaceInvalidCharacters(*tag.Value)
+			tag.Value = &val
+		}
+	}
+}
+
 func (p *awsS3Provisioner) enableBucketEncryption(bktName string) error {
 
 	defEnc := &s3.ServerSideEncryptionByDefault{SSEAlgorithm: aws.String(s3.ServerSideEncryptionAes256)}
@@ -185,8 +202,40 @@ func (p *awsS3Provisioner) enableBucketEncryption(bktName string) error {
 	if err != nil {
 		return fmt.Errorf("Server-side encrpytion for bucket %q could not be enabled: %v", bktName, err)
 	}
-	glog.Infof("Bucket %q now has no SSE-S3 encryption by default", bktName)
+	glog.Infof("Bucket %q has now bucket encryption enabled", bktName)
 	return nil
+}
+
+// NOTE:
+// This function needs optimizations, because it loops through all buckets and checks if it has a specic tag and value.
+// I did not find a way to fetch buckets with a filtering.
+func (p *awsS3Provisioner) GetBuckets(tag *s3.Tag) ([]*s3.Bucket, error) {
+
+	result, err := p.s3svc.ListBuckets(&s3.ListBucketsInput{})
+	if err != nil {
+		return nil, err
+	}
+
+	matchedBuckets := []*s3.Bucket{}
+	if result != nil && result.Buckets != nil && len(result.Buckets) > 1 {
+		for _, bucket := range result.Buckets {
+			if strings.HasPrefix(*bucket.Name, bucketPrefix) {
+				bucketInput := &s3.GetBucketTaggingInput{Bucket: bucket.Name}
+				bucketOutput, err := p.s3svc.GetBucketTagging(bucketInput)
+				if err != nil {
+					continue
+				}
+				if bucketOutput != nil && bucketOutput.TagSet != nil && len(bucketOutput.TagSet) > 0 {
+					for _, bucketTag := range bucketOutput.TagSet {
+						if *bucketTag.Key == *tag.Key && *bucketTag.Value == *tag.Value {
+							matchedBuckets = append(matchedBuckets, bucket)
+						}
+					}
+				}
+			}
+		}
+	}
+	return matchedBuckets, nil
 }
 
 func (p *awsS3Provisioner) createBucketTags(bktName string, tags []*s3.Tag) error {
@@ -202,7 +251,7 @@ func (p *awsS3Provisioner) createBucketTags(bktName string, tags []*s3.Tag) erro
 	if err != nil {
 		return fmt.Errorf("Bucket %q could not be created: %v", bktName, err)
 	}
-	glog.Infof("Bucket Tags %s successfully created", tags)
+	glog.Infof("Bucket %q is now tagged", bktName)
 	return nil
 }
 
@@ -272,13 +321,14 @@ func (p *awsS3Provisioner) setSessionAndService(sc *storageV1.StorageClass) erro
 func (p *awsS3Provisioner) initializeCreateOrGrant(options *apibkt.BucketOptions) error {
 	glog.V(2).Infof("initializing and setting CreateOrGrant services")
 	// set the bucket name
-	p.bucketName = options.BucketName
+	p.bucketName = bucketPrefix + options.BucketName
 
 	// get the OBC and its storage class
 	obc := options.ObjectBucketClaim
 
-	// set the bucket tags from the obc labels
-	p.bucketTags = p.convertLabelsToS3BucketTags(obc.ObjectMeta.Labels)
+	// set the bucket tags from the obc annotations
+	p.bucketTags = append(p.bucketTags, p.convertToS3BucketTags(obc.ObjectMeta.Annotations)...)
+	p.cleanseTagValues()
 
 	scName := options.ObjectBucketClaim.Spec.StorageClassName
 	sc, err := p.getClassByNameForBucket(scName)
@@ -384,6 +434,34 @@ func (p awsS3Provisioner) Provision(options *apibkt.BucketOptions) (*v1alpha1.Ob
 	if err != nil {
 		return nil, err
 	}
+
+	// Check if there is already a bucket with the objectbucketclaim uid
+	obc := options.ObjectBucketClaim
+	buckets, err := p.GetBuckets(&s3.Tag{
+		Key:   aws.String(obcUidTag),
+		Value: aws.String(string(obc.UID)),
+	})
+	if err != nil {
+		err = fmt.Errorf("error checking if there is already a bucket with the tag %q: %q", obcUidTag, obc.ResourceVersion)
+		glog.Errorf(err.Error())
+		return nil, err
+	}
+
+	// Do not create a new bucket, if there is already an objectbucketclaim related to bucket.
+	// Also, there should be only one bucket with the objectbucketclaim uid
+	if len(buckets) > 0 {
+		return p.rtnObjectBkt(*buckets[0].Name), nil
+	}
+
+	// Add ObjectBucketClaim uid to the bucket.
+	// We will use it to check if a bucket was already created for an ObjectBucketClaim to avoid infinite creation of buckets
+
+	p.bucketTags = append(p.bucketTags,
+		&s3.Tag{
+			Key:   aws.String(obcUidTag),
+			Value: aws.String(string(obc.UID)),
+		},
+	)
 
 	// create the bucket
 	glog.Infof("Creating bucket %q", p.bucketName)
