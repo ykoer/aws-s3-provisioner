@@ -32,6 +32,7 @@ import (
 	awsuser "github.com/aws/aws-sdk-go/service/iam"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
+	"gopkg.in/yaml.v2"
 
 	"github.com/golang/glog"
 	"github.com/kube-object-storage/lib-bucket-provisioner/pkg/apis/objectbucket.io/v1alpha1"
@@ -40,6 +41,7 @@ import (
 	bkterr "github.com/kube-object-storage/lib-bucket-provisioner/pkg/provisioner/api/errors"
 
 	storageV1 "k8s.io/api/storage/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	restclient "k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -98,6 +100,11 @@ type awsS3Provisioner struct {
 
 	// S3 server-side encryption flag
 	isBucketEncryptionRequired bool
+}
+
+type KubeInstalConfig struct {
+	BaseDomain string            `yaml:"baseDomain"`
+	Metadata   metav1.ObjectMeta `yaml:"metadata"`
 }
 
 func NewAwsS3Provisioner(cfg *restclient.Config, s3Provisioner awsS3Provisioner) (*libbkt.Provisioner, error) {
@@ -326,8 +333,27 @@ func (p *awsS3Provisioner) initializeCreateOrGrant(options *apibkt.BucketOptions
 	// get the OBC and its storage class
 	obc := options.ObjectBucketClaim
 
-	// set the bucket tags from the obc annotations
-	p.bucketTags = append(p.bucketTags, p.convertToS3BucketTags(obc.ObjectMeta.Annotations)...)
+	// Fetching cluster url (metadata.name + baseDomain) from the kube-system/cluster-config-v1 configmap
+	configMap, err := p.clientset.CoreV1().ConfigMaps("kube-system").Get("cluster-config-v1", metav1.GetOptions{})
+	if err != nil {
+		glog.Errorf("failed to get configmap \"kube-system/cluster-config-v1\": %v", err)
+		return err
+	}
+	installConfigYaml := configMap.Data["install-config"]
+	installConfig := KubeInstalConfig{}
+	err = yaml.Unmarshal([]byte(installConfigYaml), &installConfig)
+	if err != nil {
+		glog.Errorf("failed to unmarshal the cluster-configs.yaml: %v", err)
+		return err
+	}
+
+	// set the bucket tags from the obc annotation and add additional tags
+	annotations := obc.ObjectMeta.Annotations
+	annotations["Cluster"] = fmt.Sprintf("%s.%s", installConfig.Metadata.Name, installConfig.BaseDomain)
+	annotations["Namespace"] = obc.Namespace
+	annotations["Name"] = obc.Name
+
+	p.bucketTags = p.convertToS3BucketTags(obc.ObjectMeta.Annotations)
 	p.cleanseTagValues()
 
 	scName := options.ObjectBucketClaim.Spec.StorageClassName
